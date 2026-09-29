@@ -2,6 +2,7 @@
  * alvinmunk service worker — Web Push (VAPID) receiver.
  *
  * Handles:
+ *   install       — activate the new worker immediately (skipWaiting)
  *   push          — show a "your vouch was claimed" notification
  *   notificationclick — focus/open the app when the user taps the notification
  *   pushsubscriptionchange — re-subscribe after an endpoint rotation and move the
@@ -31,6 +32,11 @@ async function readWalletAddress() {
   return pushWalletAddress;
 }
 
+// ─── install ────────────────────────────────────────────────────────────────
+self.addEventListener('install', () => {
+  self.skipWaiting();
+});
+
 // ─── push ───────────────────────────────────────────────────────────────────
 self.addEventListener('push', (event) => {
   let payload = { title: '🌟 Your vouch was claimed', body: 'Someone lit their star.', vouchId: null };
@@ -45,7 +51,7 @@ self.addEventListener('push', (event) => {
 
   const options = {
     body: payload.body,
-    icon: '/assets/brand/alvinmunk-icon-192.png',
+    icon: '/assets/brand/logo-mark.png',
     badge: '/assets/brand/alvinmunk-badge-96.png',
     tag: `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
     renotify: false,               // same tag → replace, not a second buzz

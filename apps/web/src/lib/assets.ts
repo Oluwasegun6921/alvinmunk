@@ -70,6 +70,8 @@ export const BRAND = {
   wordmark: { file: 'brand/wordmark.png', w: 555, h: 193 },
   'wordmark-dark': { file: 'brand/wordmark-dark.png', w: 640, h: 285 },
   'logo-mark': { file: 'brand/logo-mark.png', w: 134, h: 191 },
+  'swicon-192': { file: 'brand/alvinmunk-icon-192.png', w: 192, h: 192 },
+  'swbadge-96': { file: 'brand/alvinmunk-badge-96.png', w: 96, h: 96 },
   'og-default': { file: 'meta/og-default.png', w: 317, h: 128 },
   favicon: { file: 'meta/favicon-32.png', w: 27, h: 37 },
   cursor: { file: 'cursors/sticker-default.png', w: 28, h: 27 },
