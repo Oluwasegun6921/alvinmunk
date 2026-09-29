@@ -45,21 +45,28 @@ export function buildRewardErrors(t: (key: string) => string): Record<number, st
   };
 }
 
+// Blocks that stop every row alike (paused, account under review, unfunded): shown once.
+const WALLET_BLOCKS = new Set([5, 10, 12]);
+// Row blocks the row doesn't already show (XP, streak and supply are on the row itself).
+const ROW_HINTS = new Set([9, 19]);
+
 /**
  * Rank -> reward unlock table (Green belt). Each reward is admin-registered on-chain
  * (Earned-XP threshold -> USDC); the contract pays the STORED amount, so rank buys
  * something real and the treasury can't be drained. Earned-gated (vouches never unlock it).
  * A reward can also require a live weekly quest streak (`min_streak`); `get_streak`
  * already reads a lapsed run as 0, so the count shown is the one the contract checks.
+ *
+ * The table renders from ONE `get_rewards_for` simulation: each row's `claimed` and
+ * `eligible` come from the contract, with `reason` = the error `claim_reward` would revert
+ * with, so a row that can't be claimed says why instead of failing on click.
  */
-type Row = RewardStatus;
-
 export function Rewards({ address }: { address: string }) {
   const t = useTranslations();
   const [earned, setEarned] = useState<number | null>(null);
   const [streak, setStreak] = useState<number>(0);
-  const [rows, setRows] = useState<Row[] | null>(null);
-  const [remainingToday, setRemainingToday] = useState<number | null>(null);
+  const [rows, setRows] = useState<RewardStatus[] | null>(null);
+  const [remainingToday, setRemainingToday] = useState<bigint | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [hash, setHash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -67,20 +74,20 @@ export function Rewards({ address }: { address: string }) {
   const refresh = useCallback(async () => {
     // Timeout the gating reads so a slow RPC degrades to "no rewards" instead of an
     // endless skeleton in front of a tester/judge.
-    const [e, status, weeks] = await Promise.all([
+    const [e, table, weeks] = await Promise.all([
       withTimeout(getEarnedScore(address, address), 12_000, 'score').catch(() => 0),
-      withTimeout(getRewardsFor(address, address), 12_000, 'rewards').catch(
-        () => [[], -1] as [RewardStatus[], number],
-      ),
+      withTimeout(getRewardsFor(address, address), 12_000, 'rewards').catch(() => ({
+        rows: [] as RewardStatus[],
+        remainingToday: null,
+      })),
       withTimeout(getStreak(address, address), 12_000, 'streak')
         .then((st) => st.weeks)
         .catch(() => 0),
     ]);
     setEarned(e);
     setStreak(weeks);
-    const [table, remaining] = status;
-    setRows(table);
-    setRemainingToday(remaining);
+    setRows(table.rows);
+    setRemainingToday(table.remainingToday);
   }, [address]);
 
   useEffect(() => {
@@ -105,6 +112,9 @@ export function Rewards({ address }: { address: string }) {
     }
   }
 
+  const errors = buildRewardErrors(t);
+  const walletBlock = rows?.find((r) => WALLET_BLOCKS.has(r.reason))?.reason;
+
   return (
     <Frame label={t('rewards.frame')} index="04" accent="secondary">
       <div className="p-5">
@@ -115,11 +125,12 @@ export function Rewards({ address }: { address: string }) {
           </Badge>
         </div>
         <p className="mb-4 text-sm text-muted-foreground">{t('rewards.subtitle')}</p>
-        {remainingToday !== null && remainingToday >= 0 && (
+        {remainingToday !== null && (
           <p className="mb-3 text-xs text-muted-foreground">
-            {t('rewards.dailyLeft', { amount: stroopsToUsdc(BigInt(remainingToday)) })}
+            {t('rewards.dailyLeft', { amount: stroopsToUsdc(remainingToday) })}
           </p>
         )}
+        {walletBlock !== undefined && <p className="mb-3 text-sm text-destructive">{errors[walletBlock]}</p>}
 
         {rows === null ? (
           <div className="flex flex-col gap-2">
@@ -130,12 +141,12 @@ export function Rewards({ address }: { address: string }) {
           <p className="text-sm text-muted-foreground">{t('rewards.noRewards')}</p>
         ) : (
           <ul className="flex flex-col gap-2">
-            {rows.map((r) => {
+            {rows.map(({ entry: r, claimed, eligible, reason }) => {
               const minStreak = r.min_streak ?? 0;
-              const unlocked = r.eligible;
               const cap = r.max_claims ?? 0;
               const left = cap > 0 ? Math.max(0, cap - (r.claims ?? 0)) : null;
               const soldOut = left === 0;
+              const hint = !claimed && ROW_HINTS.has(reason) ? errors[reason] : null;
               return (
                 <li
                   key={r.id}
@@ -157,20 +168,21 @@ export function Rewards({ address }: { address: string }) {
                         · needs a {minStreak}-week streak (you: {streak})
                       </span>
                     )}
+                    {hint && <span className="mt-0.5 block text-xs text-destructive">{hint}</span>}
                   </span>
                   <Button
                     size="sm"
-                    variant={r.claimed || soldOut || !unlocked ? 'secondary' : 'primary'}
+                    variant={claimed || soldOut || !eligible ? 'secondary' : 'primary'}
                     onClick={() => onClaim(r.id)}
-                    disabled={busy !== null || r.claimed || soldOut || !unlocked}
+                    disabled={busy !== null || claimed || soldOut || !eligible}
                   >
-                    {r.claimed
+                    {claimed
                       ? t('rewards.claimed')
                       : soldOut
                         ? t('rewards.soldOut')
                         : busy === r.id
                           ? t('rewards.claiming')
-                          : unlocked
+                          : eligible
                             ? t('rewards.claim')
                             : t('rewards.locked')}
                   </Button>

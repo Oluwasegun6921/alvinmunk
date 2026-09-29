@@ -98,14 +98,16 @@ pub struct RewardInfo {
     pub min_streak: u32, // live weekly quest streak required; 0 = none
 }
 
-/// One row of the reward table plus the caller's status, as returned by
-/// `get_rewards_for`. `eligible` mirrors the checks `claim_reward` runs.
+/// One reward row plus one wallet's claim status, as returned by `get_rewards_for`.
+/// `reason` is the `Error` code `claim_reward` would revert with right now (`0` = none),
+/// so `eligible == (reason == 0)`.
 #[contracttype]
 #[derive(Clone)]
 pub struct RewardStatus {
-    pub entry: RewardEntry,
+    pub entry: RewardInfo,
     pub claimed: bool,
     pub eligible: bool,
+    pub reason: u32,
 }
 
 #[contracttype]
@@ -346,98 +348,59 @@ impl RewardsContract {
             .unwrap_or(false)
     }
 
-    /// One-call reward status view for a wallet: every row with `claimed` and
-    /// `eligible`, plus the remaining daily budget (`-1` = unlimited).
+    /// One-call reward status view for a wallet: every row of `get_rewards` with
+    /// `claimed`, `eligible` and the `reason` it can't be claimed, plus today's remaining
+    /// treasury budget in stroops (`-1` = no daily cap).
     ///
-    /// `eligible` runs the same gates as `claim_reward` (active, not yet claimed,
-    /// earned >= threshold, not frozen, funded when required, supply left, streak
-    /// met, and today's cap can absorb the payout) without the transfer, so the UI
-    /// can explain why a reward can't be claimed right now.
+    /// `reason` runs `claim_reward`'s checks in the same order without the transfer, so it
+    /// is the first error the claim would revert with: `Paused`, `Frozen`, `NotFunded`,
+    /// `RewardInactive`, `AlreadyClaimed`, `RewardExhausted`, `BelowThreshold`,
+    /// `QuestRegistryNotSet`, `StreakTooShort`, then `DailyCapExceeded`. The Earned-XP and
+    /// streak cross-reads run at most once per call, and only when a row gets that far.
     pub fn get_rewards_for(env: Env, who: Address) -> (Vec<RewardStatus>, i128) {
-        let ids: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RewardIds)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let frozen = Self::is_frozen(env.clone(), who.clone());
-        let funded = Self::is_funded(env.clone(), who.clone());
-        let require_funding = Self::get_require_funding(env.clone());
-        let paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false);
-
-        let reputation: Address = env.storage().instance().get(&DataKey::Reputation).unwrap();
-        let func: Symbol = Symbol::new(&env, "get_earned");
-        let score: u64 = env.invoke_contract(
-            &reputation,
-            &func,
-            soroban_sdk::vec![&env, who.to_val()],
-        );
-
         let cap = Self::daily_cap(&env);
-        let day = env.ledger().timestamp() / DAY_SECS;
-        let paid: i128 = env
-            .storage()
-            .temporary()
-            .get(&DataKey::DailyPaid(day))
-            .unwrap_or(0);
-        let remaining: i128 = if cap > 0 { (cap - paid).max(0) } else { -1 };
+        let paid = Self::get_daily_paid(env.clone());
+        let remaining = if cap > 0 { (cap - paid).max(0) } else { -1 };
 
+        // The wallet-wide gates `claim_reward` checks first block every row alike.
+        let unfunded =
+            Self::get_require_funding(env.clone()) && !Self::is_funded(env.clone(), who.clone());
+        let blocked = if Self::is_paused(&env) {
+            Some(Error::Paused)
+        } else if Self::is_frozen(env.clone(), who.clone()) {
+            Some(Error::Frozen)
+        } else if unfunded {
+            Some(Error::NotFunded)
+        } else {
+            None
+        };
+
+        let mut score: Option<u64> = None;
+        let mut weeks: Option<u32> = None;
         let mut out = Vec::new(&env);
-        for id in ids.iter() {
-            if let Some(entry) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, RewardEntry>(&DataKey::Reward(id))
-            {
-                let claimed = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::RewardClaimed(id, who.clone()))
-                    .unwrap_or(false);
-
-                let stats = Self::stats(&env, id);
-                let exhausted = stats.max_claims > 0 && stats.claims >= stats.max_claims;
-
-                let min_streak = Self::min_streak(&env, id);
-                let streak_ok = if min_streak == 0 {
-                    true
-                } else {
-                    match env.storage().instance().get::<DataKey, Address>(&DataKey::QuestRegistry) {
-                        Some(qr) => {
-                            let f = Symbol::new(&env, "get_streak");
-                            let streak: Streak = env.invoke_contract(
-                                &qr,
-                                &f,
-                                soroban_sdk::vec![&env, who.to_val()],
-                            );
-                            streak.weeks >= min_streak
-                        }
-                        None => false,
-                    }
-                };
-
-                let cap_ok = cap == 0 || entry.amount <= remaining;
-
-                let eligible = !paused
-                    && entry.active
-                    && !claimed
-                    && score >= entry.threshold
-                    && !frozen
-                    && (!require_funding || funded)
-                    && !exhausted
-                    && streak_ok
-                    && cap_ok;
-
-                out.push_back(RewardStatus {
-                    entry,
-                    claimed,
-                    eligible,
-                });
-            }
+        for entry in Self::get_rewards(env.clone()).iter() {
+            let claimed = Self::is_claimed(env.clone(), entry.id, who.clone());
+            let reason = if let Some(e) = blocked {
+                Some(e)
+            } else if !entry.active {
+                Some(Error::RewardInactive)
+            } else if claimed {
+                Some(Error::AlreadyClaimed)
+            } else if entry.max_claims > 0 && entry.claims >= entry.max_claims {
+                Some(Error::RewardExhausted)
+            } else if *score.get_or_insert_with(|| Self::earned(&env, &who)) < entry.threshold {
+                Some(Error::BelowThreshold)
+            } else if let Some(e) = Self::streak_block(&env, &who, entry.min_streak, &mut weeks) {
+                Some(e)
+            } else {
+                Self::daily_block(cap, paid, entry.amount)
+            };
+            out.push_back(RewardStatus {
+                entry,
+                claimed,
+                eligible: reason.is_none(),
+                reason: reason.map_or(0, |e| e as u32),
+            });
         }
         (out, remaining)
     }
@@ -473,11 +436,7 @@ impl RewardsContract {
         // Cross-contract read of the EARNED track ONLY (belts/08-anti-sybil keystone):
         // social/vouch XP is NEVER cashable; the treasury is reachable only via
         // attester-verified quest XP.
-        let reputation: Address = env.storage().instance().get(&DataKey::Reputation).unwrap();
-        let func: Symbol = Symbol::new(&env, "get_earned"); // >9 chars => not symbol_short
-        let args = soroban_sdk::vec![&env, to.to_val()];
-        let score: u64 = env.invoke_contract(&reputation, &func, args);
-        if score < entry.threshold {
+        if Self::earned(&env, &to) < entry.threshold {
             panic_with_error!(&env, Error::BelowThreshold);
         }
 
@@ -489,10 +448,7 @@ impl RewardsContract {
         let min_streak = Self::min_streak(&env, reward_id);
         if min_streak > 0 {
             let quest_registry = Self::quest_registry(&env);
-            let func = Symbol::new(&env, "get_streak"); // >9 chars => not symbol_short
-            let streak: Streak =
-                env.invoke_contract(&quest_registry, &func, soroban_sdk::vec![&env, to.to_val()]);
-            if streak.weeks < min_streak {
+            if Self::streak_weeks(&env, &quest_registry, &to) < min_streak {
                 panic_with_error!(&env, Error::StreakTooShort);
             }
         }
@@ -702,14 +658,62 @@ impl RewardsContract {
             .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
     }
 
-    fn not_paused(env: &Env) {
-        let paused: bool = env
-            .storage()
+    fn is_paused(env: &Env) -> bool {
+        env.storage()
             .instance()
             .get(&DataKey::Paused)
-            .unwrap_or(false);
-        if paused {
+            .unwrap_or(false)
+    }
+
+    fn not_paused(env: &Env) {
+        if Self::is_paused(env) {
             panic_with_error!(env, Error::Paused);
+        }
+    }
+
+    /// Cross-contract read of `who`'s EARNED track (the only cashable one).
+    fn earned(env: &Env, who: &Address) -> u64 {
+        let reputation: Address = env.storage().instance().get(&DataKey::Reputation).unwrap();
+        let func: Symbol = Symbol::new(env, "get_earned"); // >9 chars => not symbol_short
+        env.invoke_contract(&reputation, &func, soroban_sdk::vec![env, who.to_val()])
+    }
+
+    /// Cross-contract read of `who`'s live weekly quest streak.
+    fn streak_weeks(env: &Env, quest_registry: &Address, who: &Address) -> u32 {
+        let func = Symbol::new(env, "get_streak"); // >9 chars => not symbol_short
+        let streak: Streak =
+            env.invoke_contract(quest_registry, &func, soroban_sdk::vec![env, who.to_val()]);
+        streak.weeks
+    }
+
+    /// The error `claim_reward`'s streak gate would raise for a `min_streak` (0 = none).
+    /// The live streak is read once per call and kept in `weeks`.
+    fn streak_block(
+        env: &Env,
+        who: &Address,
+        min_streak: u32,
+        weeks: &mut Option<u32>,
+    ) -> Option<Error> {
+        if min_streak == 0 {
+            return None;
+        }
+        let Some(quest_registry) = env.storage().instance().get(&DataKey::QuestRegistry) else {
+            return Some(Error::QuestRegistryNotSet);
+        };
+        if *weeks.get_or_insert_with(|| Self::streak_weeks(env, &quest_registry, who)) < min_streak
+        {
+            Some(Error::StreakTooShort)
+        } else {
+            None
+        }
+    }
+
+    /// The error `charge_daily` would raise for one more payout of `amount` today.
+    fn daily_block(cap: i128, paid: i128, amount: i128) -> Option<Error> {
+        match paid.checked_add(amount) {
+            None => Some(Error::Overflow),
+            Some(next) if cap > 0 && next > cap => Some(Error::DailyCapExceeded),
+            Some(_) => None,
         }
     }
 
