@@ -5,7 +5,7 @@ import { getWallet } from '@/lib/wallet';
 import { txExplorerUrl } from '@/lib/stellar';
 import { getEarnedScore } from '@/lib/reputation';
 import { getStreak } from '@/lib/quests';
-import { claimReward, getRewards, getUsdcBalance, isClaimed, stroopsToUsdc, usdcToStroops, type RewardEntry } from '@/lib/rewards';
+import { claimReward, getRewardsFor, getUsdcBalance, stroopsToUsdc, usdcToStroops, type RewardStatus } from '@/lib/rewards';
 import {
   getAnchorConfig,
   getWithdrawalStatus,
@@ -52,13 +52,14 @@ export function buildRewardErrors(t: (key: string) => string): Record<number, st
  * A reward can also require a live weekly quest streak (`min_streak`); `get_streak`
  * already reads a lapsed run as 0, so the count shown is the one the contract checks.
  */
-type Row = RewardEntry & { claimed: boolean };
+type Row = RewardStatus;
 
 export function Rewards({ address }: { address: string }) {
   const t = useTranslations();
   const [earned, setEarned] = useState<number | null>(null);
   const [streak, setStreak] = useState<number>(0);
   const [rows, setRows] = useState<Row[] | null>(null);
+  const [remainingToday, setRemainingToday] = useState<number | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [hash, setHash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,24 +67,20 @@ export function Rewards({ address }: { address: string }) {
   const refresh = useCallback(async () => {
     // Timeout the gating reads so a slow RPC degrades to "no rewards" instead of an
     // endless skeleton in front of a tester/judge.
-    const [e, table, weeks] = await Promise.all([
+    const [e, status, weeks] = await Promise.all([
       withTimeout(getEarnedScore(address, address), 12_000, 'score').catch(() => 0),
-      withTimeout(getRewards(address), 12_000, 'rewards').catch(() => [] as RewardEntry[]),
+      withTimeout(getRewardsFor(address, address), 12_000, 'rewards').catch(
+        () => [[], -1] as [RewardStatus[], number],
+      ),
       withTimeout(getStreak(address, address), 12_000, 'streak')
         .then((st) => st.weeks)
         .catch(() => 0),
     ]);
     setEarned(e);
     setStreak(weeks);
-    const withClaimed = await Promise.all(
-      table.map(async (r) => ({
-        ...r,
-        claimed: await withTimeout(isClaimed(r.id, address, address), 12_000, 'claim status').catch(
-          () => false,
-        ),
-      })),
-    );
-    setRows(withClaimed);
+    const [table, remaining] = status;
+    setRows(table);
+    setRemainingToday(remaining);
   }, [address]);
 
   useEffect(() => {
@@ -118,6 +115,11 @@ export function Rewards({ address }: { address: string }) {
           </Badge>
         </div>
         <p className="mb-4 text-sm text-muted-foreground">{t('rewards.subtitle')}</p>
+        {remainingToday !== null && remainingToday >= 0 && (
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t('rewards.dailyLeft', { amount: stroopsToUsdc(BigInt(remainingToday)) })}
+          </p>
+        )}
 
         {rows === null ? (
           <div className="flex flex-col gap-2">
@@ -130,7 +132,7 @@ export function Rewards({ address }: { address: string }) {
           <ul className="flex flex-col gap-2">
             {rows.map((r) => {
               const minStreak = r.min_streak ?? 0;
-              const unlocked = (earned ?? 0) >= Number(r.threshold) && streak >= minStreak;
+              const unlocked = r.eligible;
               const cap = r.max_claims ?? 0;
               const left = cap > 0 ? Math.max(0, cap - (r.claims ?? 0)) : null;
               const soldOut = left === 0;

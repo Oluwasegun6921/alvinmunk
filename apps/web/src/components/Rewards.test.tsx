@@ -1,14 +1,14 @@
+
 import React from 'react';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RewardEntry } from '@/lib/rewards';
 
-const { getEarnedScoreMock, getRewardsMock, isClaimedMock, getStreakMock, claimRewardMock } = vi.hoisted(
+const { getEarnedScoreMock, getRewardsForMock, getStreakMock, claimRewardMock } = vi.hoisted(
   () => ({
     getEarnedScoreMock: vi.fn(),
-    getRewardsMock: vi.fn(),
-    isClaimedMock: vi.fn(),
+    getRewardsForMock: vi.fn(),
     getStreakMock: vi.fn(),
     claimRewardMock: vi.fn(),
   }),
@@ -18,8 +18,7 @@ vi.mock('@/lib/reputation', () => ({ getEarnedScore: getEarnedScoreMock }));
 vi.mock('@/lib/quests', () => ({ getStreak: getStreakMock }));
 vi.mock('@/lib/rewards', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/rewards')>()),
-  getRewards: getRewardsMock,
-  isClaimed: isClaimedMock,
+  getRewardsFor: getRewardsForMock,
   claimReward: claimRewardMock,
   getUsdcBalance: vi.fn(),
 }));
@@ -49,6 +48,13 @@ const reward = (id: number, extra: Partial<RewardEntry> = {}): RewardEntry => ({
   ...extra,
 });
 
+const status = (entry: RewardEntry, extra: Partial<{ claimed: boolean; eligible: boolean }> = {}) => ({
+  entry,
+  claimed: false,
+  eligible: true,
+  ...extra,
+});
+
 describe('Rewards', () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -58,7 +64,7 @@ describe('Rewards', () => {
     document.body.appendChild(container);
     root = createRoot(container);
     getEarnedScoreMock.mockResolvedValue(50);
-    isClaimedMock.mockResolvedValue(false);
+    getRewardsForMock.mockResolvedValue([[], -1]);
     getStreakMock.mockResolvedValue({ weeks: 2, best: 3, lastWeek: 100 });
   });
 
@@ -78,10 +84,9 @@ describe('Rewards', () => {
   const button = (li: Element) => li.querySelector('button')!;
 
   it('shows a streak requirement with the wallet’s live streak and locks it until met', async () => {
-    getRewardsMock.mockResolvedValue([
-      reward(1, { min_streak: 4 }),
-      reward(2, { min_streak: 2 }),
-      reward(3), // contract deployed before streak gates: no min_streak field
+    getRewardsForMock.mockResolvedValue([
+      [status(reward(1, { min_streak: 4 }), { eligible: false }), status(reward(2, { min_streak: 2 })), status(reward(3))],
+      -1,
     ]);
     await render();
 
@@ -101,14 +106,14 @@ describe('Rewards', () => {
 
   it('still needs the Earned XP threshold when the streak is met', async () => {
     getEarnedScoreMock.mockResolvedValue(10);
-    getRewardsMock.mockResolvedValue([reward(1, { min_streak: 1 })]);
+    getRewardsForMock.mockResolvedValue([[status(reward(1, { min_streak: 1 }), { eligible: false })], -1]);
     await render();
     expect(button(items()[0]).textContent).toBe('Locked');
   });
 
   it('reads a failed streak lookup as no streak: gated rewards stay locked, others don’t', async () => {
     getStreakMock.mockRejectedValue(new Error('rpc down'));
-    getRewardsMock.mockResolvedValue([reward(1, { min_streak: 1 }), reward(2)]);
+    getRewardsForMock.mockResolvedValue([[status(reward(1, { min_streak: 1 }), { eligible: false }), status(reward(2))], -1]);
     await render();
     const [gated, plain] = items();
     expect(gated.textContent).toContain('needs a 1-week streak (you: 0)');
@@ -117,7 +122,7 @@ describe('Rewards', () => {
   });
 
   it('explains a StreakTooShort (#18) revert from claim_reward', async () => {
-    getRewardsMock.mockResolvedValue([reward(1, { min_streak: 2 })]);
+    getRewardsForMock.mockResolvedValue([[status(reward(1, { min_streak: 2 }), { eligible: false })], -1]);
     claimRewardMock.mockRejectedValue(new Error('HostError: Error(Contract, #18)'));
     await render();
     await act(async () => {
@@ -126,3 +131,4 @@ describe('Rewards', () => {
     expect(container.textContent).toContain('This reward needs a longer weekly quest streak');
   });
 });
+

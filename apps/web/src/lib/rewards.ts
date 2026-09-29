@@ -167,6 +167,33 @@ export interface RewardEntry {
   min_streak?: number;
 }
 
+/** One row of the reward table with this wallet's claim state resolved on-chain. */
+export interface RewardStatus {
+  entry: RewardEntry;
+  claimed: boolean;
+  eligible: boolean;
+}
+
+/** Result of the single-call reward status view. */
+export interface RewardsFor {
+  statuses: RewardStatus[];
+  /** Remaining daily budget in stroops, or -1n when unlimited. */
+  remainingToday: bigint;
+}
+
+/** One-call reward status view: every row with `claimed`/`eligible` plus the remaining
+ *  daily budget (-1 = unlimited). Replaces N + 2 per-row simulations. */
+export async function getRewardsFor(who: string, source: string): Promise<RewardsFor> {
+  const v = await readContract<[RewardStatus[], bigint]>(
+    rewardsId(),
+    'get_rewards_for',
+    [args.addr(who)],
+    source,
+  );
+  const [statuses, remainingToday] = v ?? [[], -1n];
+  return { statuses: statuses ?? [], remainingToday: BigInt(remainingToday ?? -1n) };
+}
+
 /** The full unlock table (admin-registered on-chain). */
 export async function getRewards(source: string): Promise<RewardEntry[]> {
   const v = await readContract<RewardEntry[]>(rewardsId(), 'get_rewards', [], source);

@@ -707,6 +707,146 @@ fn set_reward_min_streak_zero_clears_the_gate() {
     f.rewards.claim_reward(&user, &1u32);
 }
 
+// --- get_rewards_for: one-call reward status view per wallet ---
+
+#[test]
+fn get_rewards_for_reports_claimed_and_eligible_per_row() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.add_reward(&2u32, &60u64, &100i128);
+    let user = earner(&f, 60);
+    f.rewards.claim_reward(&user, &1u32);
+
+    let (rows, remaining) = f.rewards.get_rewards_for(&user);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(remaining, -1); // no cap set = unlimited
+
+    let r1 = rows.get(0).unwrap();
+    assert_eq!(r1.entry.id, 1);
+    assert!(r1.claimed);
+    assert!(!r1.eligible); // already claimed
+
+    let r2 = rows.get(1).unwrap();
+    assert_eq!(r2.entry.id, 2);
+    assert!(!r2.claimed);
+    assert!(r2.eligible); // clears threshold, active, funded
+}
+
+#[test]
+fn get_rewards_for_returns_remaining_daily_budget() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &200i128);
+    f.rewards.set_daily_cap(&500i128);
+    let user = earner(&f, 30);
+
+    let (_, remaining) = f.rewards.get_rewards_for(&user);
+    assert_eq!(remaining, 500);
+
+    f.rewards.claim_reward(&user, &1u32);
+    let (_, remaining) = f.rewards.get_rewards_for(&user);
+    assert_eq!(remaining, 300);
+}
+
+#[test]
+fn get_rewards_for_marks_inactive_as_ineligible() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.set_reward_active(&1u32, &false);
+    let user = earner(&f, 30);
+
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible);
+}
+
+#[test]
+fn get_rewards_for_marks_below_threshold_as_ineligible() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &50u64, &50i128);
+    let user = earner(&f, 10); // below threshold
+
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible);
+}
+
+#[test]
+fn get_rewards_for_marks_frozen_as_ineligible() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    let user = earner(&f, 30);
+    f.rewards.set_frozen(&user, &true);
+
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible);
+}
+
+#[test]
+fn get_rewards_for_marks_unfunded_as_ineligible_when_required() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.set_require_funding(&true);
+    let user = earner(&f, 30);
+
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible); // funding required but not proven
+
+    f.rewards.set_funded(&user, &true);
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(r.eligible);
+}
+
+#[test]
+fn get_rewards_for_marks_exhausted_as_ineligible() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.set_reward_supply(&1u32, &1u32);
+    let a = earner(&f, 30);
+    f.rewards.claim_reward(&a, &1u32);
+
+    let b = earner(&f, 30);
+    let (rows, _) = f.rewards.get_rewards_for(&b);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible); // pool exhausted
+}
+
+#[test]
+fn get_rewards_for_marks_streak_too_short_as_ineligible() {
+    let f = streak_setup();
+    f.rewards.add_reward(&1u32, &10u64, &100i128);
+    f.rewards.set_reward_min_streak(&1u32, &3u32);
+    let user = streaker(&f, &[0, 1]); // streak 2 < 3
+
+    let (rows, _) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(!r.eligible);
+}
+
+#[test]
+fn get_rewards_for_eligible_when_all_conditions_met() {
+    let f = setup();
+    f.rewards.add_reward(&1u32, &30u64, &50i128);
+    f.rewards.set_daily_cap(&500i128);
+    f.rewards.set_require_funding(&true);
+    let user = earner(&f, 30);
+    f.rewards.set_funded(&user, &true);
+
+    let (rows, remaining) = f.rewards.get_rewards_for(&user);
+    let r = rows.get(0).unwrap();
+    assert!(!r.claimed);
+    assert!(r.eligible);
+    assert_eq!(remaining, 500);
+}
+
 #[test]
 fn set_reward_min_streak_emits_rwd_strk() {
     let f = streak_setup();

@@ -98,6 +98,16 @@ pub struct RewardInfo {
     pub min_streak: u32, // live weekly quest streak required; 0 = none
 }
 
+/// One row of the reward table plus the caller's status, as returned by
+/// `get_rewards_for`. `eligible` mirrors the checks `claim_reward` runs.
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardStatus {
+    pub entry: RewardEntry,
+    pub claimed: bool,
+    pub eligible: bool,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -334,6 +344,102 @@ impl RewardsContract {
             .persistent()
             .get(&DataKey::RewardClaimed(reward_id, who))
             .unwrap_or(false)
+    }
+
+    /// One-call reward status view for a wallet: every row with `claimed` and
+    /// `eligible`, plus the remaining daily budget (`-1` = unlimited).
+    ///
+    /// `eligible` runs the same gates as `claim_reward` (active, not yet claimed,
+    /// earned >= threshold, not frozen, funded when required, supply left, streak
+    /// met, and today's cap can absorb the payout) without the transfer, so the UI
+    /// can explain why a reward can't be claimed right now.
+    pub fn get_rewards_for(env: Env, who: Address) -> (Vec<RewardStatus>, i128) {
+        let ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RewardIds)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let frozen = Self::is_frozen(env.clone(), who.clone());
+        let funded = Self::is_funded(env.clone(), who.clone());
+        let require_funding = Self::get_require_funding(env.clone());
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        let reputation: Address = env.storage().instance().get(&DataKey::Reputation).unwrap();
+        let func: Symbol = Symbol::new(&env, "get_earned");
+        let score: u64 = env.invoke_contract(
+            &reputation,
+            &func,
+            soroban_sdk::vec![&env, who.to_val()],
+        );
+
+        let cap = Self::daily_cap(&env);
+        let day = env.ledger().timestamp() / DAY_SECS;
+        let paid: i128 = env
+            .storage()
+            .temporary()
+            .get(&DataKey::DailyPaid(day))
+            .unwrap_or(0);
+        let remaining: i128 = if cap > 0 { (cap - paid).max(0) } else { -1 };
+
+        let mut out = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RewardEntry>(&DataKey::Reward(id))
+            {
+                let claimed = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RewardClaimed(id, who.clone()))
+                    .unwrap_or(false);
+
+                let stats = Self::stats(&env, id);
+                let exhausted = stats.max_claims > 0 && stats.claims >= stats.max_claims;
+
+                let min_streak = Self::min_streak(&env, id);
+                let streak_ok = if min_streak == 0 {
+                    true
+                } else {
+                    match env.storage().instance().get::<DataKey, Address>(&DataKey::QuestRegistry) {
+                        Some(qr) => {
+                            let f = Symbol::new(&env, "get_streak");
+                            let streak: Streak = env.invoke_contract(
+                                &qr,
+                                &f,
+                                soroban_sdk::vec![&env, who.to_val()],
+                            );
+                            streak.weeks >= min_streak
+                        }
+                        None => false,
+                    }
+                };
+
+                let cap_ok = cap == 0 || entry.amount <= remaining;
+
+                let eligible = !paused
+                    && entry.active
+                    && !claimed
+                    && score >= entry.threshold
+                    && !frozen
+                    && (!require_funding || funded)
+                    && !exhausted
+                    && streak_ok
+                    && cap_ok;
+
+                out.push_back(RewardStatus {
+                    entry,
+                    claimed,
+                    eligible,
+                });
+            }
+        }
+        (out, remaining)
     }
 
     /// Claim a registered reward. Gated on the EARNED track only (keystone); the payout
