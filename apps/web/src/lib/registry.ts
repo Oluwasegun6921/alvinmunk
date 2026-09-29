@@ -3,7 +3,9 @@
  * shareable identity that resolves for ANY wallet (not just the logged-in user).
  * Validate/normalize the handle with normalizeHandle() BEFORE calling claim.
  */
+import { isMissingFunction } from '@alvinmunk/sdk';
 import { invokeAndWait, invokeCosigned, readPublic, args, registryId } from './contracts';
+import { readClient } from './sdk';
 import type { Wallet } from './wallet';
 import { encodeAvatar, decodeAvatar, type AvatarConfig } from './avatar';
 import { sanitizeBio } from './profile';
@@ -12,10 +14,9 @@ import { shareInFlight } from './utils';
 /** Resolve `@handle` → address (public, wallet-free). null if unclaimed/unconfigured. */
 export async function resolveHandle(handle: string): Promise<string | null> {
   if (!registryId() || !handle) return null;
-  const v = await readPublic<string | null>(registryId(), 'resolve', [args.sym(handle)]).catch(
-    () => null,
-  );
-  return v ?? null;
+  return readClient()
+    .resolveHandle(handle)
+    .catch(() => null);
 }
 
 /**
@@ -28,9 +29,8 @@ export async function reverseHandle(
   { strict = false }: { strict?: boolean } = {},
 ): Promise<string | null> {
   if (!registryId() || !address) return null;
-  const read = readPublic<string | null>(registryId(), 'reverse', [args.addr(address)]);
-  const v = await (strict ? read : read.catch(() => null));
-  return v ?? null;
+  const read = readClient().reverseHandle(address);
+  return strict ? read : read.catch(() => null);
 }
 
 /** Most addresses per `reverse_many` call; mirrors `REVERSE_MANY_CAP` in the contract. */
@@ -120,7 +120,11 @@ export async function handleAvailability(
   address?: string,
 ): Promise<HandleAvailability> {
   const [owner, cooldown] = await Promise.all([resolveHandle(handle), getHandleCooldown(handle)]);
-  if (owner !== null) return { status: 'taken' };
+  if (owner !== null) {
+    // If the handle is owned by the checking address, it's available for them to reclaim
+    if (owner === address) return { status: 'free' };
+    return { status: 'taken' };
+  }
   if (cooldown && cooldown.prevOwner !== address) {
     return { status: 'reserved', until: cooldown.until };
   }
@@ -176,12 +180,6 @@ export interface OnChainMeta {
   /** undefined when the stored face is one this build can't render → show the default. */
   avatar: AvatarConfig | undefined;
   bio: string;
-}
-
-/** True when the error says the deployed registry has no such function (it predates it). */
-function isMissingFunction(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e ?? '');
-  return /Error\(WasmVm, MissingValue\)|non-existent contract function/.test(msg);
 }
 
 /**
