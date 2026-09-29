@@ -33,6 +33,8 @@ async function readWalletAddress() {
 }
 
 // ─── install ────────────────────────────────────────────────────────────────
+// Without skipWaiting an updated worker stays "waiting" until every tab running the
+// old one is closed; `activate` below then claims the open tabs.
 self.addEventListener('install', () => {
   self.skipWaiting();
 });
@@ -51,7 +53,7 @@ self.addEventListener('push', (event) => {
 
   const options = {
     body: payload.body,
-    icon: '/assets/brand/logo-mark.png',
+    icon: '/assets/brand/alvinmunk-icon-192.png',
     badge: '/assets/brand/alvinmunk-badge-96.png',
     tag: `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
     renotify: false,               // same tag → replace, not a second buzz
